@@ -50,6 +50,7 @@ class AsyncKalshiClient(_BaseKalshiClient):
         self,
         api_key_id: str | None = None,
         private_key_path: str | None = None,
+        private_key: str | Any | None = None,
         api_base: str | None = None,
         demo: bool = False,
         timeout: float = 10.0,
@@ -59,6 +60,7 @@ class AsyncKalshiClient(_BaseKalshiClient):
         super().__init__(
             api_key_id=api_key_id,
             private_key_path=private_key_path,
+            private_key=private_key,
             api_base=api_base,
             demo=demo,
             timeout=timeout,
