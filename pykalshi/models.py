@@ -1,8 +1,9 @@
 from __future__ import annotations
 import warnings
+from dataclasses import dataclass
 from decimal import Decimal
 from functools import cached_property
-from typing import Annotated
+from typing import Annotated, Generic, TypeVar
 from pydantic import (
     AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, model_validator,
 )
@@ -23,6 +24,10 @@ _LegacySide = Annotated[Side | None, BeforeValidator(blank_to_none)]
 _LegacyAction = Annotated[Action | None, BeforeValidator(blank_to_none)]
 _OptBookSide = Annotated[BookSide | None, BeforeValidator(blank_to_none)]
 _OptOutcomeSide = Annotated[OutcomeSide | None, BeforeValidator(blank_to_none)]
+# Free text the server might send as a number; never fail a parse over it.
+_OptText = Annotated[
+    str | None, BeforeValidator(lambda v: v if v is None or isinstance(v, str) else str(v))
+]
 
 
 class HistoricalCutoffResponse(BaseModel):
@@ -303,6 +308,50 @@ class OrderModel(BaseModel):
     def is_ask(self) -> bool:
         """True when this order is long no (``book_side == ask``)."""
         return self.book_side == BookSide.ASK
+
+
+class BatchOrderError(BaseModel):
+    """Why the API refused one item of a batch, e.g.
+    ``{"code": "invalid_order", "details": "post only cross"}``."""
+
+    code: _OptText = None
+    message: _OptText = None
+    details: _OptText = None
+    service: _OptText = None
+
+    model_config = ConfigDict(extra="ignore")
+
+    @property
+    def reason(self) -> str:
+        """The most specific text available: details, else message, else code."""
+        return self.details or self.message or self.code or "unknown error"
+
+
+OrderT = TypeVar("OrderT")
+
+
+@dataclass(frozen=True)
+class BatchOrderResult(Generic[OrderT]):
+    """The outcome of one item of a batch order request.
+
+    Exactly one of `order` and `error` is set, except when the outcome is
+    unknown (the response held no item for this request, or one that couldn't
+    be matched to it with certainty, or that was neither placed nor refused):
+    then both are None -- look the order up (e.g. by client_order_id) before
+    re-sending.
+    """
+
+    index: int
+    """Position of the item in the list passed to the batch call."""
+    request: dict
+    """The item as the caller passed it."""
+    order: OrderT | None = None
+    error: BatchOrderError | None = None
+
+    @property
+    def ok(self) -> bool:
+        """True when the API accepted the item."""
+        return self.order is not None
 
 
 class IndexedBalanceModel(BaseModel):

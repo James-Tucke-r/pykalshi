@@ -934,6 +934,237 @@ def test_batch_item_refuses_buy_max_cost_dollars(client):
         }])
 
 
+def _two_items(coids=(None, None)):
+    items = [
+        {"ticker": "KXREAL", "action": "buy", "side": "yes",
+         "count_fp": "1.00", "yes_price_dollars": "0.40"},
+        {"ticker": "KXCROSS", "action": "buy", "side": "no",
+         "count_fp": "2.00", "no_price_dollars": "0.30", "post_only": True},
+    ]
+    for item, coid in zip(items, coids):
+        if coid:
+            item["client_order_id"] = coid
+    return items
+
+
+def test_batch_place_orders_with_results_keeps_the_refusal_reason(client, mock_response, caplog):
+    """batch_place_orders drops a refused item and only logs why; callers that
+    act on the reason (requote on 'post only cross') need it handed back."""
+    client._session.request.return_value = mock_response({"orders": [
+        {"order_id": "o1", "fill_count": "0.00", "remaining_count": "1.00", "ts_ms": 1},
+        {"error": {"code": "invalid_order", "message": "invalid order",
+                   "details": "post only cross"}},
+    ]})
+    orders = _two_items()
+
+    with caplog.at_level("WARNING", logger="pykalshi._sync.portfolio"):
+        results = client.portfolio.batch_place_orders_with_results(orders)
+
+    assert [r.index for r in results] == [0, 1]
+    assert [r.ok for r in results] == [True, False]
+    assert results[0].request is orders[0]
+    assert results[0].order.order_id == "o1"
+    assert results[0].order.ticker == "KXREAL"
+    assert results[0].order.data.yes_price_dollars == "0.4000"
+    assert results[0].error is None
+    assert results[1].order is None
+    assert results[1].error.code == "invalid_order"
+    assert results[1].error.details == "post only cross"
+    assert results[1].error.reason == "post only cross"
+    # The caller gets the refusal, so it isn't also logged as a warning.
+    assert caplog.text == ""
+    # Same request on the wire as batch_place_orders.
+    body = json.loads(client._session.request.call_args.kwargs["content"])
+    assert [o["ticker"] for o in body["orders"]] == ["KXREAL", "KXCROSS"]
+    assert body["orders"][1]["post_only"] is True
+
+
+def test_batch_place_orders_with_results_matches_by_client_order_id(client, mock_response):
+    """Results come back in request order even when the response doesn't,
+    refusals included."""
+    client._session.request.return_value = mock_response({"orders": [
+        {"client_order_id": "c2", "error": {"code": "invalid_order", "details": "post only cross"}},
+        {"order_id": "o1", "client_order_id": "c1", "remaining_count": "1.00", "ts_ms": 1},
+    ]})
+
+    results = client.portfolio.batch_place_orders_with_results(_two_items(("c1", "c2")))
+
+    assert results[0].order.order_id == "o1"
+    assert results[0].order.ticker == "KXREAL"
+    assert results[1].error.reason == "post only cross"
+    assert results[1].request["client_order_id"] == "c2"
+
+
+def test_batch_place_orders_with_results_marks_unanswered_items_unknown(client, mock_response):
+    """A request item the response says nothing about is neither placed nor
+    refused: report both as None rather than guess."""
+    client._session.request.return_value = mock_response({"orders": [
+        {"order_id": "o1", "client_order_id": "c1", "remaining_count": "1.00", "ts_ms": 1},
+    ]})
+
+    results = client.portfolio.batch_place_orders_with_results(_two_items(("c1", "c2")))
+
+    assert len(results) == 2
+    assert results[0].ok
+    assert results[1].order is None and results[1].error is None
+    assert not results[1].ok
+
+
+def test_batch_place_orders_with_results_short_reply_without_ids_is_all_unknown(client, mock_response):
+    """With no client_order_ids, one reply for two requests could belong to
+    either: neither is reported placed or refused."""
+    client._session.request.return_value = mock_response({"orders": [
+        {"order_id": "o1", "remaining_count": "1.00", "ts_ms": 1},
+    ]})
+
+    results = client.portfolio.batch_place_orders_with_results(_two_items())
+
+    assert [(r.order, r.error) for r in results] == [(None, None), (None, None)]
+
+
+def test_batch_place_orders_with_results_tolerates_odd_error_shapes(client, mock_response):
+    client._session.request.return_value = mock_response({"orders": [
+        {"error": "market closed"},
+        {"error": {"code": 409, "message": "conflict"}},
+    ]})
+
+    results = client.portfolio.batch_place_orders_with_results(_two_items())
+
+    assert results[0].error.reason == "market closed"
+    assert results[1].error.code == "409"
+    assert results[1].error.reason == "conflict"
+
+
+def test_batch_place_orders_with_results_never_calls_a_live_order_refused(client, mock_response):
+    """A refusal that doesn't echo its client_order_id, in a reordered reply,
+    must not land on the request whose order is live (the caller would
+    re-send it). The order matched by client_order_id wins; the refusal can't
+    be placed with certainty, so the other request reads as unknown."""
+    client._session.request.return_value = mock_response({"orders": [
+        {"error": {"code": "invalid_order", "details": "post only cross"}},
+        {"order_id": "o1", "client_order_id": "c1", "remaining_count": "1.00", "ts_ms": 1},
+    ]})
+
+    results = client.portfolio.batch_place_orders_with_results(_two_items(("c1", "c2")))
+
+    assert results[0].order.order_id == "o1"
+    assert results[0].error is None
+    assert results[1].order is None and results[1].error is None
+
+
+def test_batch_place_orders_with_results_no_positions_when_items_are_missing(client, mock_response):
+    """With an item missing from the middle of the reply, positions no longer
+    line up: matching by position would hand C's order to B."""
+    client._session.request.return_value = mock_response({"orders": [
+        {"order_id": "oA", "remaining_count": "1.00", "ts_ms": 1},
+        {"order_id": "oC", "remaining_count": "1.00", "ts_ms": 1},
+    ]})
+    orders = _two_items() + [{"ticker": "KXC", "action": "buy", "side": "yes",
+                              "count_fp": "1.00", "yes_price_dollars": "0.10"}]
+
+    results = client.portfolio.batch_place_orders_with_results(orders)
+
+    assert [r.ok for r in results] == [False, False, False]
+    assert all(r.error is None for r in results)
+
+
+def test_batch_place_orders_with_results_refuses_shared_client_order_ids(client):
+    with pytest.raises(ValueError, match="client_order_id"):
+        client.portfolio.batch_place_orders_with_results(_two_items(("c1", "c1")))
+    client._session.request.assert_not_called()
+
+
+@pytest.mark.parametrize("item", [
+    {"client_order_id": "c1", "status": "resting"},   # neither order_id nor error
+    {"client_order_id": "c1", "error": None},
+    {"order": {"order_id": "o1", "ticker": "KXREAL", "status": "resting",
+               "client_order_id": "c1"},
+     "error": {"details": "post only cross"}},         # placed and refused at once
+    {"order_id": "o1", "client_order_id": "c1",
+     "error": {"details": "post only cross"}},         # the same, in the thin-ack shape
+])
+def test_batch_place_orders_with_results_reads_contradictions_as_unknown(client, mock_response, item):
+    """Only an explicit error is a refusal: anything else that isn't a clean
+    order is unknown, never 'refused' (which invites a re-send)."""
+    client._session.request.return_value = mock_response({"orders": [item]})
+
+    [result] = client.portfolio.batch_place_orders_with_results(_two_items(("c1",))[:1])
+
+    assert result.order is None and result.error is None
+
+
+def test_batch_place_orders_with_results_no_positions_once_the_reply_is_reordered(client, mock_response):
+    """A client_order_id match out of place shows the reply doesn't keep
+    request order, so items without one can't be matched by position: B's
+    live order must not read as refused because A's refusal sits in B's slot."""
+    client._session.request.return_value = mock_response({"orders": [
+        {"order_id": "o3", "client_order_id": "c3", "remaining_count": "1.00", "ts_ms": 1},
+        {"error": {"code": "invalid_order", "details": "post only cross"}},
+        {"order_id": "oB", "remaining_count": "1.00", "ts_ms": 1},
+    ]})
+    a, b = _two_items(("c1", None))
+    c = {"ticker": "KXC", "action": "buy", "side": "yes", "count_fp": "1.00",
+         "yes_price_dollars": "0.10", "client_order_id": "c3"}
+
+    results = client.portfolio.batch_place_orders_with_results([a, b, c])
+
+    assert results[2].order.order_id == "o3"
+    assert [(r.order, r.error) for r in results[:2]] == [(None, None), (None, None)]
+
+
+def test_batch_place_orders_with_results_ignores_extra_reply_items(client, mock_response):
+    client._session.request.return_value = mock_response({"orders": [
+        {"order_id": "o1", "remaining_count": "1.00", "ts_ms": 1},
+        {"order_id": "o2", "remaining_count": "1.00", "ts_ms": 1},
+    ]})
+
+    results = client.portfolio.batch_place_orders_with_results(_two_items()[:1])
+
+    # Two replies for one request: positions can't be trusted.
+    assert len(results) == 1 and results[0].order is None and results[0].error is None
+
+
+def test_batch_place_orders_survives_an_unhashable_client_order_id(client, mock_response):
+    client._session.request.return_value = mock_response({"orders": [
+        {"client_order_id": ["odd"], "error": {"code": "invalid_order"}},
+    ]})
+
+    assert list(client.portfolio.batch_place_orders(_two_items()[:1])) == []
+
+
+def test_batch_place_orders_with_results_validates_like_batch_place_orders(client):
+    with pytest.raises(ValueError, match="buy_max_cost_dollars"):
+        client.portfolio.batch_place_orders_with_results([{
+            "ticker": "KXTEST", "action": "buy", "side": "yes",
+            "count_fp": "1.00", "yes_price_dollars": "0.57",
+            "buy_max_cost_dollars": "0.0001",
+        }])
+    client._session.request.assert_not_called()
+
+
+async def test_async_batch_place_orders_with_results(mocker, mock_response):
+    from unittest.mock import AsyncMock
+    from pykalshi import AsyncKalshiClient, AsyncOrder
+
+    mocker.patch("pykalshi._base._BaseKalshiClient._load_private_key")
+    mocker.patch(
+        "pykalshi._base._BaseKalshiClient._sign_request",
+        return_value=("1234567890", "fake_sig"),
+    )
+    mocker.patch("httpx.AsyncClient")
+    c = AsyncKalshiClient(api_key_id="fake_key", private_key_path="fake_path", demo=True)
+    c._session.request = AsyncMock(return_value=mock_response({"orders": [
+        {"order_id": "o1", "remaining_count": "1.00", "ts_ms": 1},
+        {"error": {"code": "invalid_order", "details": "post only cross"}},
+    ]}))
+
+    results = await c.portfolio.batch_place_orders_with_results(_two_items())
+
+    assert isinstance(results[0].order, AsyncOrder)
+    assert results[0].order.order_id == "o1"
+    assert results[1].error.reason == "post only cross"
+
+
 def test_place_order_keeps_the_realised_fill_price_and_fee(client, mock_response):
     """A marketable order's ack carries average_fill_price/average_fee_paid --
     the only place a caller sees what the order actually paid without a

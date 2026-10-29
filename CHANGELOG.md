@@ -97,6 +97,20 @@
   `refill_rate` and emitting a `DeprecationWarning`.
 ### Added
 
+- **`batch_place_orders_with_results`: each batch item's outcome, refusals
+  included.** `batch_place_orders` drops an item the API refused and only
+  logs why, so callers that act on the reason (e.g. requote after
+  `"post only cross"`) had to post the batch themselves through the private
+  `_build_batch_orders`. The new method sends the same request and returns
+  one `BatchOrderResult` per request item, in request order: `.order` when
+  placed, else `.error` (a `BatchOrderError` with `code`, `message`,
+  `details` and a `.reason` shortcut). Replies are matched to requests by
+  `client_order_id`, and by position only when that is unambiguous; when the
+  outcome can't be known for certain (no reply for the item, an ambiguous
+  match, an item neither placed nor refused) both are None, so a live order
+  is never reported as refused. Items sharing a `client_order_id` raise
+  `ValueError`. Sync and async. `batch_place_orders` returns and logs as
+  before.
 - **Intra-account transfers across exchange shards.**
   `intra_account_transfer(amount_centicents=...)` wraps
   `POST /portfolio/intra_exchange_instance_transfer`, with

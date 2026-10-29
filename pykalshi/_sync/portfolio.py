@@ -23,6 +23,7 @@ from ..models import (
     SubaccountModel, SubaccountBalanceModel, SubaccountTransferModel,
     SubaccountNettingModel,
     IntraAccountTransferModel, TargetBalanceAllocationModel,
+    BatchOrderError, BatchOrderResult,
 )
 
 if TYPE_CHECKING:
@@ -511,6 +512,91 @@ class Portfolio:
             Order(self._client, m)
             for m in self._orders_from_v2_batch(response, prepared, orders)
         )
+
+    def batch_place_orders_with_results(
+        self, orders: list[dict]
+    ) -> list[BatchOrderResult[Order]]:
+        """Place multiple orders and report what happened to each one.
+
+        Same request as `batch_place_orders`, but nothing is dropped: the
+        result has one entry per item of `orders`, in the same order, holding
+        either the placed Order or the API's reason for refusing that item.
+        Refusals are not logged, since the caller gets them.
+
+        Args:
+            orders: Order dicts, as for `batch_place_orders`.
+
+        Returns:
+            One BatchOrderResult per request item. `result.order` is set when
+            the item was accepted; otherwise `result.error` carries the API's
+            code/message/details (e.g. details "post only cross"). When the
+            outcome is unknown, both are None: look the order up (by
+            client_order_id) before re-sending it.
+
+        Response items are matched to requests by client_order_id. One that
+        carries none is matched by position, but only when the response has
+        exactly one item per request and no client_order_id match already
+        claimed that request; anything ambiguous reads as unknown rather than
+        risk calling a live order refused. Give every item a client_order_id
+        for the most reliable results.
+
+        Raises:
+            ValueError: As `batch_place_orders`, and when two items share a
+                client_order_id (their results couldn't be told apart).
+
+        Example:
+            for r in portfolio.batch_place_orders_with_results(orders):
+                if not r.ok:
+                    print(r.request["ticker"], r.error.reason if r.error else "unknown")
+        """
+        prepared = self._build_batch_orders(orders)
+        sent_coids = [p.get("client_order_id") for p in prepared]
+        named = [c for c in sent_coids if c]
+        if len(named) != len(set(named)):
+            raise ValueError("Batch items must not share a client_order_id")
+        response = self._client.post("/portfolio/events/orders/batched", {"orders": prepared})
+        # Position means something only while the reply visibly keeps request order.
+        positional_ok = len(response.get("orders") or []) == len(orders)
+
+        claimed: dict[int, BatchOrderResult[Order] | None] = {}
+        by_position = []
+        for idx, i, item, model, error in self._v2_batch_items(response, prepared, orders):
+            legacy = item.get("order")
+            coid = (legacy if isinstance(legacy, dict) else item).get("client_order_id")
+            refused = item.get("error") is not None
+            placed = model is not None or item.get("order_id") is not None
+            if not 0 <= i < len(orders) or (placed and refused):
+                result = None   # no such request, or placed and refused at once: unknown
+            elif model is not None:
+                result = BatchOrderResult(i, orders[i], order=Order(self._client, model))
+            elif refused:
+                result = BatchOrderResult(i, orders[i], error=(
+                    BatchOrderError.model_validate(error) if isinstance(error, dict)
+                    else BatchOrderError(message=str(error))
+                ))
+            else:
+                result = None   # neither placed nor refused: unknown
+            if isinstance(coid, str) and coid and coid in named:
+                # Two response items naming one request: trust neither.
+                claimed[i] = None if i in claimed else result
+                positional_ok = positional_ok and i == idx
+            elif coid:
+                positional_ok = False
+                logger.warning(
+                    "Batch response item %d names a client_order_id that wasn't sent: %s", idx, item)
+            else:
+                by_position.append((idx, item, result))
+        for idx, item, result in by_position:
+            if positional_ok and idx not in claimed:
+                claimed[idx] = result
+            else:
+                logger.warning(
+                    "Batch response item %d can't be matched to a request item: %s", idx, item)
+        results = [claimed.get(i) for i in range(len(orders))]
+        return [
+            r if r is not None else BatchOrderResult(i, orders[i])
+            for i, r in enumerate(results)
+        ]
 
     def batch_cancel_orders(
         self,
@@ -1034,24 +1120,12 @@ class Portfolio:
         ts_ms}, which would otherwise infer `resting` for an order that was in
         fact canceled).
         """
-        items = response.get("orders") or []
         prepared = prepared or []
-        originals = originals or []
-        by_coid = {
-            p.get("client_order_id"): i
-            for i, p in enumerate(prepared)
-            if p.get("client_order_id")
-        }
-
         models: list[OrderModel] = []
-        for idx, item in enumerate(items):
-            if not isinstance(item, dict):
-                continue
-            legacy = item.get("order")
-            if isinstance(legacy, dict):
-                models.append(OrderModel.model_validate(legacy))
-                continue
-            if item.get("error") is not None or item.get("order_id") is None:
+        for idx, _i, item, model, error in Portfolio._v2_batch_items(
+            response, prepared, originals, default_status
+        ):
+            if model is None:
                 req = prepared[idx] if idx < len(prepared) else {}
                 logger.warning(
                     "Batch item %d (%s) was rejected and is missing from the "
@@ -1061,11 +1135,57 @@ class Portfolio:
                     or req.get("order_id")
                     or req.get("ticker")
                     or "unidentified",
-                    item.get("error", item),
+                    error,
                 )
                 continue
+            models.append(model)
+        return models
 
-            i = by_coid.get(item.get("client_order_id"), idx)
+    @staticmethod
+    def _v2_batch_items(
+        response: dict,
+        prepared: list[dict] | None = None,
+        originals: list[dict] | None = None,
+        default_status: OrderStatus | None = None,
+    ):
+        """Yield (response index, request index, item, OrderModel or None,
+        error) for each item of a batched response; see _orders_from_v2_batch.
+
+        A rejected item yields model None and its `error` value (the whole item
+        when it has neither an error nor an order_id). Non-dict items are
+        skipped. The request index is matched by client_order_id where the
+        item carries one the caller supplied, else it is the response index.
+        """
+        items = response.get("orders") or []
+        prepared = prepared or []
+        originals = originals or []
+        by_coid = {
+            p.get("client_order_id"): i
+            for i, p in enumerate(prepared)
+            if p.get("client_order_id")
+        }
+
+        def match(coid, idx: int) -> int:
+            return by_coid.get(coid, idx) if isinstance(coid, str) else idx
+
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            legacy = item.get("order")
+            if isinstance(legacy, dict):
+                yield (
+                    idx,
+                    match(legacy.get("client_order_id"), idx),
+                    item,
+                    OrderModel.model_validate(legacy),
+                    None,
+                )
+                continue
+            i = match(item.get("client_order_id"), idx)
+            if item.get("error") is not None or item.get("order_id") is None:
+                yield idx, i, item, None, item.get("error", item)
+                continue
+
             req = prepared[i] if i < len(prepared) else {}
             orig = originals[i] if i < len(originals) else {}
 
@@ -1099,8 +1219,7 @@ class Portfolio:
                 entry["average_fee_paid_dollars"] = item["average_fee_paid"]
             if item.get("reduced_by") is not None:
                 entry["reduced_by_fp"] = item["reduced_by"]
-            models.append(OrderModel.model_validate(entry))
-        return models
+            yield idx, i, item, OrderModel.model_validate(entry), None
 
     @staticmethod
     def _build_order_data(
