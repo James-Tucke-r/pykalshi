@@ -84,6 +84,16 @@
   `refill_rate` and emitting a `DeprecationWarning`.
 ### Added
 
+- **Intra-account transfers across exchange shards.**
+  `intra_account_transfer(amount_centicents=...)` wraps
+  `POST /portfolio/intra_exchange_instance_transfer`, with
+  `get_intra_account_transfer(s)` to confirm one landed. The amount is in
+  CENTICENTS (not the cents `transfer_between_subaccounts` takes), so the
+  argument is keyword-only and named for its unit. A response without a
+  `transfer_id` raises rather than losing the only handle on the transfer.
+- **`get_target_balance_allocation` / `set_target_balance_allocation`** for
+  automatic rebalancing across shards (percentages must total 100; an empty
+  list turns it off).
 - **`average_fill_price_dollars` / `average_fee_paid_dollars` on `Order`** —
   carried by the V2 create/amend ack (single and batch) and previously
   discarded. This is the only place a caller sees what an order actually paid

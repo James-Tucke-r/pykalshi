@@ -953,6 +953,35 @@ class SubaccountNettingModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class IntraAccountTransferModel(BaseModel):
+    """A transfer within one account, possibly between exchange shards.
+
+    MIND THE UNITS: the POST that creates one of these takes ``amount`` in
+    CENTICENTS (1 cent = 100 centicents), while this GET response reports
+    ``amount`` as a fixed-point DOLLAR string. Same name, different units.
+    """
+    # All of these are required by the spec, so they are required here too:
+    # defaulting them would turn a renamed field into a silent zero or None.
+    transfer_id: str
+    source: str                          # "event_contract" | "margined"
+    destination: str
+    source_exchange_shard: int
+    destination_exchange_shard: int
+    amount: str                          # fixed-point dollar string
+    status: str                          # "pending" | "complete"
+    created_ts: int                      # Unix timestamp
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class TargetBalanceAllocationModel(BaseModel):
+    """One exchange shard's share of the automatically rebalanced balance."""
+    exchange_index: int
+    percent: int                         # 0-100; all allocations total 100
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class ForecastPoint(BaseModel):
     """A single point in forecast percentile history."""
     ts: int  # Unix timestamp

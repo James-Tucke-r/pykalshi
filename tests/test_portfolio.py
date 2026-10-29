@@ -1217,3 +1217,134 @@ def test_decrease_order_subaccount_is_query_param(client, mock_response):
     assert "/portfolio/events/orders/order-abc-123/decrease?subaccount=3" in call_args.args[1]
     body = json.loads(call_args.kwargs["content"])
     assert body == {"reduce_by": "5.00"}
+
+
+# --- Intra-account (cross-shard) transfers and balance allocation ---------
+# These assert the WIRE BODY. A fake that records keyword arguments proves the
+# caller's arithmetic and nothing about what leaves the process -- and the unit
+# here (centicents) differs from the neighbouring endpoint's (cents) by 100x.
+
+
+def test_intra_account_transfer_sends_documented_schema(client, mock_response):
+    """IntraExchangeInstanceTransferRequest: source/destination enums, amount
+    in CENTICENTS, and the four shard/subaccount ints."""
+    client._session.request.return_value = mock_response({"transfer_id": "t-1"})
+
+    got = client.portfolio.intra_account_transfer(
+        amount_centicents=500000,              # $50.00
+        source_exchange_shard=0,
+        destination_exchange_shard=2,
+        source_subaccount=0,
+        destination_subaccount=1,
+    )
+
+    assert got == "t-1"
+    call_args = client._session.request.call_args
+    assert call_args.args[0] == "POST"
+    assert call_args.args[1].endswith("/portfolio/intra_exchange_instance_transfer")
+    body = json.loads(call_args.kwargs["content"])
+    assert body == {
+        "source": "event_contract",
+        "destination": "event_contract",
+        "amount": 500000,
+        "source_exchange_shard": 0,
+        "destination_exchange_shard": 2,
+        "source_subaccount": 0,
+        "destination_subaccount": 1,
+    }
+    assert isinstance(body["amount"], int)
+
+
+def test_fifty_dollars_is_five_hundred_thousand_centicents_not_five_thousand(
+        client, mock_response):
+    """The endpoint next door takes CENTS. Sending cents here moves 1/100th."""
+    client._session.request.return_value = mock_response({"transfer_id": "t"})
+    client.portfolio.intra_account_transfer(amount_centicents=500000)
+    body = json.loads(client._session.request.call_args.kwargs["content"])
+    assert body["amount"] == 500000 and body["amount"] != 5000
+
+
+def test_intra_account_transfer_raises_when_the_receipt_is_missing(
+        client, mock_response):
+    """The money may have moved; losing the id loses the only way to confirm."""
+    client._session.request.return_value = mock_response({})
+    with pytest.raises(ValueError, match="no transfer_id"):
+        client.portfolio.intra_account_transfer(amount_centicents=100)
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5, "500000", None])
+def test_intra_account_transfer_rejects_bad_amounts(client, bad):
+    with pytest.raises(ValueError):
+        client.portfolio.intra_account_transfer(amount_centicents=bad)
+
+
+@pytest.mark.parametrize("shard", [-1, 101, True, "2"])
+def test_intra_account_transfer_rejects_bad_shards(client, shard):
+    with pytest.raises(ValueError):
+        client.portfolio.intra_account_transfer(
+            amount_centicents=100, destination_exchange_shard=shard)
+
+
+def test_intra_account_transfer_refuses_subaccounts_on_margined_transfers(client):
+    """The spec limits the subaccount fields to event_contract -> event_contract."""
+    with pytest.raises(ValueError, match="event_contract"):
+        client.portfolio.intra_account_transfer(
+            amount_centicents=100, destination="margined", destination_subaccount=1)
+
+
+def test_get_intra_account_transfer_unwraps_the_record(client, mock_response):
+    client._session.request.return_value = mock_response({"transfer": {
+        "transfer_id": "t-9", "source": "event_contract",
+        "destination": "event_contract", "source_exchange_shard": 0,
+        "destination_exchange_shard": 2, "amount": "50.0000",
+        "status": "complete", "created_ts": 1789204023}})
+
+    t = client.portfolio.get_intra_account_transfer("t-9")
+
+    call_args = client._session.request.call_args
+    assert call_args.args[0] == "GET"
+    assert call_args.args[1].endswith("/portfolio/intra_exchange_instance_transfers/t-9")
+    assert (t.transfer_id, t.status, t.amount) == ("t-9", "complete", "50.0000")
+    assert t.destination_exchange_shard == 2
+
+
+def test_get_intra_account_transfers_enforces_the_spec_limit(client):
+    for bad in (0, 501, True):
+        with pytest.raises(ValueError, match="1-500"):
+            client.portfolio.get_intra_account_transfers(limit=bad)
+
+
+def test_set_target_balance_allocation_sends_documented_schema(client, mock_response):
+    client._session.request.return_value = mock_response({})
+    client.portfolio.set_target_balance_allocation(
+        [(0, 80), (2, 20)], resting_margin_reservation="max")
+    call_args = client._session.request.call_args
+    assert call_args.args[0] == "POST"
+    assert call_args.args[1].endswith("/portfolio/target_balance_allocation")
+    assert json.loads(call_args.kwargs["content"]) == {
+        "allocations": [{"exchange_index": 0, "percent": 80},
+                        {"exchange_index": 2, "percent": 20}],
+        "resting_margin_reservation": "max"}
+
+
+def test_target_allocation_must_total_one_hundred(client):
+    with pytest.raises(ValueError, match="100"):
+        client.portfolio.set_target_balance_allocation([(0, 80), (2, 10)])
+
+
+def test_an_empty_allocation_disables_rebalancing(client, mock_response):
+    """Documented behaviour: an empty array turns automatic rebalancing off."""
+    client._session.request.return_value = mock_response({})
+    client.portfolio.set_target_balance_allocation([])
+    assert json.loads(client._session.request.call_args.kwargs["content"]) == {
+        "allocations": []}
+
+
+def test_get_target_balance_allocation_parses_rows(client, mock_response):
+    client._session.request.return_value = mock_response({
+        "allocations": [{"exchange_index": 0, "percent": 80},
+                        {"exchange_index": 2, "percent": 20}],
+        "resting_margin_reservation": "sum"})
+    got = client.portfolio.get_target_balance_allocation()
+    assert [(a.exchange_index, a.percent) for a in got["allocations"]] == [(0, 80), (2, 20)]
+    assert got["resting_margin_reservation"] == "sum"

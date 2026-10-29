@@ -22,6 +22,7 @@ from ..models import (
     SettlementModel, QueuePositionModel, OrderGroupModel,
     SubaccountModel, SubaccountBalanceModel, SubaccountTransferModel,
     SubaccountNettingModel,
+    IntraAccountTransferModel, TargetBalanceAllocationModel,
 )
 
 if TYPE_CHECKING:
@@ -71,8 +72,9 @@ class Portfolio:
         Args:
             subaccount: Subaccount number (0 for primary, 1-63 for
                 subaccounts). Defaults to the primary account.
-            exchange_index: Exchange shard identifier. Currently only 0 is
-                supported.
+            exchange_index: Exchange shard to scope the balance to. Omit to
+                include every shard (balances are per-shard; see
+                intra_account_transfer).
         """
         params: dict = {}
         if subaccount is not None:
@@ -639,8 +641,9 @@ class Portfolio:
         of 63 numbered subaccounts (64 including the primary account 0).
 
         Args:
-            exchange_index: Exchange shard to create the subaccount on.
-                Defaults to 0 (currently the only supported value).
+            exchange_index: Exchange shard to provision the subaccount on.
+                Defaults to 0. A subaccount exists only on the shards it was
+                created on, and Crypto/Commodities markets live on shard 2.
 
         Returns:
             SubaccountModel with the assigned ``subaccount_number``.
@@ -676,7 +679,8 @@ class Portfolio:
             client_transfer_id: Idempotency key (UUID string). Auto-generated
                 if not supplied.
             exchange_index: Exchange shard to apply the transfer on.
-                Defaults to 0 (currently the only supported value).
+                Defaults to 0. Both subaccounts must already exist on that
+                shard; use intra_account_transfer to move money ACROSS shards.
 
         Returns:
             The ``client_transfer_id`` used, for idempotent retries and
@@ -1239,3 +1243,166 @@ class Portfolio:
             item.update(o)
             prepared.append(item)
         return prepared
+
+    # --- Intra-account transfers and shard balance allocation ---
+
+    def intra_account_transfer(
+        self,
+        *,
+        amount_centicents: int,
+        source_exchange_shard: int = 0,
+        destination_exchange_shard: int = 0,
+        source_subaccount: int = 0,
+        destination_subaccount: int = 0,
+        source: str = "event_contract",
+        destination: str = "event_contract",
+    ) -> str:
+        """Move funds inside your own account, across exchange shards.
+
+        Kalshi splits trading across matching engines ("exchange shards"), and
+        COLLATERAL IS LOCAL TO A SHARD: an order for a market on shard 2 can
+        only be collateralised by balance on shard 2. Subaccount balances are
+        local too, so a subaccount funded on shard 0 cannot trade a shard-2
+        market at all -- every such order is rejected with
+        PERMISSION_DENIED_FOR_SUBTRADER. Crypto and Commodities moved to shard
+        2 on 2026-08-24 and 2026-09-10.
+
+        UNITS: ``amount_centicents`` is CENTICENTS (1 cent = 100 centicents),
+        per the API spec -- NOT the cents that transfer_between_subaccounts
+        takes. Cents here would move 1/100th of what you meant and dollars
+        would move 100x, so the parameter is named for its unit and is
+        keyword-only.
+
+        When both shards are equal, Kalshi treats this as a subaccount transfer
+        and the id appears in the subaccount transfer history instead.
+
+        NOT ATOMIC across shards: the docs say such a transfer runs in up to
+        three steps and a later failure does not undo the earlier ones, so
+        money can be left in the PRIMARY account on either shard. It is also
+        processed asynchronously -- confirm with
+        get_intra_account_transfer(transfer_id) and re-read the balances.
+
+        Returns the transfer id.
+        """
+        if isinstance(amount_centicents, bool) or not isinstance(amount_centicents, int):
+            raise ValueError(
+                f"amount_centicents must be an int of CENTICENTS, got "
+                f"{amount_centicents!r}")
+        if amount_centicents <= 0:
+            raise ValueError("amount_centicents must be positive")
+        for name, shard in (("source_exchange_shard", source_exchange_shard),
+                            ("destination_exchange_shard", destination_exchange_shard)):
+            if isinstance(shard, bool) or not isinstance(shard, int) or not (0 <= shard <= 100):
+                raise ValueError(f"{name} must be 0-100, got {shard!r}")
+        for name, sub in (("source_subaccount", source_subaccount),
+                          ("destination_subaccount", destination_subaccount)):
+            if isinstance(sub, bool) or not isinstance(sub, int) or not (0 <= sub <= 63):
+                raise ValueError(f"{name} must be 0-63, got {sub!r}")
+        for name, inst in (("source", source), ("destination", destination)):
+            if inst not in ("event_contract", "margined"):
+                raise ValueError(
+                    f"{name} must be 'event_contract' or 'margined', got {inst!r}")
+        # The spec limits the subaccount fields to event-contract transfers.
+        if (source_subaccount or destination_subaccount) and not (
+                source == destination == "event_contract"):
+            raise ValueError(
+                "source_subaccount/destination_subaccount are only supported "
+                "for event_contract to event_contract transfers")
+        body = {
+            "source": source,
+            "destination": destination,
+            "amount": amount_centicents,
+            "source_exchange_shard": source_exchange_shard,
+            "destination_exchange_shard": destination_exchange_shard,
+            "source_subaccount": source_subaccount,
+            "destination_subaccount": destination_subaccount,
+        }
+        response = self._client.post(
+            "/portfolio/intra_exchange_instance_transfer", body)
+        transfer_id = (response or {}).get("transfer_id")
+        if not transfer_id:
+            # The money may well have moved; losing the id means losing the
+            # only handle for confirming it. Fail loudly with the raw response.
+            raise ValueError(
+                f"intra-account transfer returned no transfer_id; the transfer "
+                f"may still have been accepted. Raw response: {response!r}")
+        return transfer_id
+
+    def get_intra_account_transfers(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        fetch_all: bool = False,
+        **extra_params,
+    ) -> DataFrameList[IntraAccountTransferModel]:
+        """Intra-account transfer history, newest first (paginated, max 500)."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 500):
+            raise ValueError(f"limit must be 1-500 per the spec, got {limit!r}")
+        params = {"limit": limit, "cursor": cursor, **extra_params}
+        data = self._client.paginated_get(
+            "/portfolio/intra_exchange_instance_transfers", "transfers",
+            params, fetch_all)
+        return DataFrameList(
+            IntraAccountTransferModel.model_validate(t) for t in data)
+
+    def get_intra_account_transfer(self, transfer_id: str) -> IntraAccountTransferModel:
+        """One intra-account transfer by id -- use it to confirm an async transfer landed."""
+        data = self._client.get(
+            f"/portfolio/intra_exchange_instance_transfers/{transfer_id}")
+        return IntraAccountTransferModel.model_validate(
+            (data or {}).get("transfer", data))
+
+    def get_target_balance_allocation(self) -> dict:
+        """Automatic rebalancing settings across exchange shards.
+
+        Returns {"allocations": DataFrameList[TargetBalanceAllocationModel],
+        "resting_margin_reservation": "max"|"sum"|None}. An empty allocations
+        list means automatic rebalancing is off, and balance stays wherever it
+        happens to be -- which is how a shard can quietly run out of
+        collateral while another one holds the money.
+        """
+        data = self._client.get("/portfolio/target_balance_allocation") or {}
+        return {
+            "allocations": DataFrameList(
+                TargetBalanceAllocationModel.model_validate(a)
+                for a in (data.get("allocations") or [])),
+            "resting_margin_reservation": data.get("resting_margin_reservation"),
+        }
+
+    def set_target_balance_allocation(
+        self,
+        allocations,
+        *,
+        resting_margin_reservation: str | None = None,
+    ) -> None:
+        """Replace the automatic rebalancing target across shards.
+
+        ``allocations`` is an iterable of (exchange_index, percent) pairs or
+        dicts with those keys. Percentages must total 100; an EMPTY list
+        disables automatic rebalancing. ``resting_margin_reservation`` is what
+        a rebalance leaves behind for resting orders: "max" reserves the
+        largest single market-side commitment, "sum" every resting order's
+        margin (the API default).
+        """
+        items = []
+        for a in allocations:
+            idx, pct = (a["exchange_index"], a["percent"]) if isinstance(a, dict) else a
+            if not isinstance(idx, int) or idx < 0:
+                raise ValueError(f"exchange_index must be >= 0, got {idx!r}")
+            if not isinstance(pct, int) or not (0 <= pct <= 100):
+                raise ValueError(f"percent must be 0-100, got {pct!r}")
+            items.append({"exchange_index": idx, "percent": pct})
+        if len(items) > 101:
+            raise ValueError(f"at most 101 allocations, got {len(items)}")
+        total = sum(i["percent"] for i in items)
+        if items and total != 100:
+            raise ValueError(f"allocations must total 100%, got {total}%")
+        if resting_margin_reservation not in (None, "max", "sum"):
+            raise ValueError(
+                f"resting_margin_reservation must be 'max' or 'sum', got "
+                f"{resting_margin_reservation!r}")
+        body: dict = {"allocations": items}
+        if resting_margin_reservation is not None:
+            body["resting_margin_reservation"] = resting_margin_reservation
+        self._client.post("/portfolio/target_balance_allocation", body)
