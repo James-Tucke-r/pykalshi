@@ -67,3 +67,58 @@ def test_invalid_private_key_type():
     """Test that passing an invalid type to private_key raises TypeError."""
     with pytest.raises(TypeError, match="Expected private_key to be str or RSAPrivateKey, got int"):
         _BaseKalshiClient(private_key=12345)
+
+
+# ---------------------------------------------------------------------------
+# Cancel routing (exchange shards)
+# ---------------------------------------------------------------------------
+# Orders on a non-zero exchange shard (e.g. the USDC crypto shard) cannot be
+# cancelled without exchange_index or market_ticker: the API defaults to shard 0
+# and returns 404. See "Cancel Order (V2)" / "Batch Cancel Orders (V2)".
+
+from unittest.mock import MagicMock
+
+from pykalshi._sync.portfolio import Portfolio
+from pykalshi.enums import OrderStatus
+
+
+def _portfolio(response):
+    client = MagicMock()
+    client.delete.return_value = response
+    return Portfolio(client), client
+
+
+def test_cancel_order_defaults_send_no_routing_params():
+    p, client = _portfolio({"order_id": "o1", "ticker": "T"})
+    p.cancel_order("o1")
+    assert client.delete.call_args[0][0] == "/portfolio/events/orders/o1"
+
+
+def test_cancel_order_sends_market_ticker_and_exchange_index():
+    p, client = _portfolio({"order_id": "o1", "ticker": "T"})
+    p.cancel_order("o1", exchange_index=-1, market_ticker="KXBTC15M-26SEP010000-00")
+    endpoint = client.delete.call_args[0][0]
+    assert "exchange_index=-1" in endpoint
+    assert "market_ticker=KXBTC15M-26SEP010000-00" in endpoint
+
+
+def test_cancel_order_sends_explicit_shard():
+    p, client = _portfolio({"order_id": "o1", "ticker": "T"})
+    p.cancel_order("o1", exchange_index=2)
+    assert "exchange_index=2" in client.delete.call_args[0][0]
+
+
+def test_batch_cancel_applies_routing_to_every_item():
+    p, client = _portfolio({"orders": [{"order_id": "a"}, {"order_id": "b"}]})
+    p.batch_cancel_orders(["a", "b"], exchange_index=-1, market_ticker="T")
+    body = client.delete.call_args[0][1]
+    assert len(body["orders"]) == 2
+    for item in body["orders"]:
+        assert item["exchange_index"] == -1
+        assert item["market_ticker"] == "T"
+
+
+def test_batch_cancel_without_routing_is_unchanged():
+    p, client = _portfolio({"orders": [{"order_id": "a"}]})
+    p.batch_cancel_orders(["a"])
+    assert client.delete.call_args[0][1]["orders"] == [{"order_id": "a"}]

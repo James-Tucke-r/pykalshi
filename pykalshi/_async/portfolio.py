@@ -191,19 +191,38 @@ class AsyncPortfolio:
         )
         return AsyncOrder(self._client, model)
 
-    async def cancel_order(self, order_id: str, *, subaccount: int | None = None) -> AsyncOrder:
+    async def cancel_order(
+        self,
+        order_id: str,
+        *,
+        subaccount: int | None = None,
+        exchange_index: int | None = None,
+        market_ticker: str | None = None,
+    ) -> AsyncOrder:
         """Cancel a resting order.
 
         Args:
             order_id: ID of the order to cancel.
             subaccount: Subaccount number (0 for primary, 1-63 for subaccounts).
+            exchange_index: Exchange shard index. When omitted the API auto-routes
+                if `market_ticker` is supplied and otherwise defaults to shard 0,
+                so cancelling an order that lives on another shard without either
+                argument returns 404. Pass -1 to require auto-routing by ticker.
+            market_ticker: Market ticker used to auto-route the cancellation.
 
         Returns:
             The canceled Order with updated status.
         """
-        endpoint = f"/portfolio/events/orders/{order_id}"
+        params: dict = {}
         if subaccount is not None:
-            endpoint += f"?subaccount={subaccount}"
+            params["subaccount"] = subaccount
+        if exchange_index is not None:
+            params["exchange_index"] = exchange_index
+        if market_ticker is not None:
+            params["market_ticker"] = market_ticker
+        endpoint = f"/portfolio/events/orders/{order_id}"
+        if params:
+            endpoint += f"?{urlencode(params)}"
         response = await self._client.delete(endpoint)
         model = self._order_from_v2_ack(
             response, ticker=response.get("ticker"), status=OrderStatus.CANCELED
@@ -491,11 +510,22 @@ class AsyncPortfolio:
             for m in self._orders_from_v2_batch(response, prepared, orders)
         )
 
-    async def batch_cancel_orders(self, order_ids: list[str]) -> DataFrameList[AsyncOrder]:
+    async def batch_cancel_orders(
+        self,
+        order_ids: list[str],
+        *,
+        exchange_index: int | None = None,
+        market_ticker: str | None = None,
+    ) -> DataFrameList[AsyncOrder]:
         """Cancel multiple orders atomically.
 
         Args:
             order_ids: List of order IDs to cancel (max 20).
+            exchange_index: Exchange shard index applied to every item. When
+                omitted the API auto-routes if `market_ticker` is supplied and
+                otherwise defaults to shard 0, so orders resting on another shard
+                are reported not-found. Pass -1 to require auto-routing.
+            market_ticker: Market ticker used to auto-route the cancellations.
 
         Returns:
             The canceled Orders, each with status CANCELED and `reduced_by_fp`
@@ -504,12 +534,20 @@ class AsyncPortfolio:
             shorter than `order_ids` -- compare the lengths before treating a
             mass cancel as complete.
         """
-        orders = [{"order_id": oid} for oid in order_ids]
+        def _item(oid: str) -> dict:
+            item: dict = {"order_id": oid}
+            if exchange_index is not None:
+                item["exchange_index"] = exchange_index
+            if market_ticker is not None:
+                item["market_ticker"] = market_ticker
+            return item
+
+        orders = [_item(oid) for oid in order_ids]
         response = await self._client.delete("/portfolio/events/orders/batched", {"orders": orders})
         return DataFrameList(
             AsyncOrder(self._client, m)
             for m in self._orders_from_v2_batch(
-                response, [{"order_id": oid} for oid in order_ids],
+                response, [_item(oid) for oid in order_ids],
                 default_status=OrderStatus.CANCELED,
             )
         )

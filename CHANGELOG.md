@@ -40,6 +40,10 @@
   `**extra_params` for forward compatibility.
 ### Fixed
 
+- **Cancelling an order on another exchange shard returned 404.** The API
+  defaults a cancel to shard 0. `cancel_order` and `batch_cancel_orders` now
+  take `exchange_index` and `market_ticker` (pass `exchange_index=-1` to
+  require auto-routing by ticker); without them the request is unchanged.
 - **`batch_cancel_orders` reported every canceled order as `resting`.** A
   batch-cancel receipt carries no counts (`BatchCancelOrdersV2Response` items
   are `{order_id, reduced_by, ts_ms}`), so the count-derived status inferred
