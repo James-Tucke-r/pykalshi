@@ -3,6 +3,8 @@
 .env.*
 *.key
 *.pem
+gpg-batch-config
+*.gpg
 
 # Python
 __pycache__/
