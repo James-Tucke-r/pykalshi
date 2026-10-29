@@ -17,7 +17,7 @@ import httpx
 if TYPE_CHECKING:
     from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
-from .._base import _BaseKalshiClient, _RETRYABLE_STATUS_CODES
+from .._base import _BaseKalshiClient, _RETRYABLE_STATUS_CODES, _NON_IDEMPOTENT_METHODS
 from .events import Event
 from .markets import Market, Series
 from .mve import MveCollection
@@ -89,6 +89,9 @@ class KalshiClient(_BaseKalshiClient):
     def _request(self, method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
         """Execute async HTTP request with retry on transient failures."""
         url = f"{self.api_base}{endpoint}"
+        # See _NON_IDEMPOTENT_METHODS: a POST is never silently re-sent once it
+        # may have reached the server.
+        replay_safe = method.upper() not in _NON_IDEMPOTENT_METHODS
 
         for attempt in range(self.max_retries + 1):
             if self.rate_limiter is not None:
@@ -103,6 +106,15 @@ class KalshiClient(_BaseKalshiClient):
             try:
                 response = self._session.request(method, url, **request_kwargs)
             except httpx.TimeoutException as e:
+                sent = not isinstance(e, (httpx.ConnectTimeout, httpx.PoolTimeout))
+                if not replay_safe and sent:
+                    logger.error(
+                        "%s %s timed out after the request may have reached the "
+                        "server (%s). NOT retrying: it may already have taken "
+                        "effect. Check state before sending it again.",
+                        method, endpoint, type(e).__name__,
+                    )
+                    raise
                 if attempt == self.max_retries:
                     raise
                 wait = self._compute_backoff(attempt, None)
@@ -128,6 +140,14 @@ class KalshiClient(_BaseKalshiClient):
             self._update_rate_limiter(response)
 
             if response.status_code not in _RETRYABLE_STATUS_CODES:
+                return response
+            if not replay_safe and response.status_code != 429:
+                # A 5xx after a POST does not prove nothing happened.
+                logger.error(
+                    "%s %s returned %d. NOT retrying a non-idempotent request: "
+                    "it may already have taken effect.",
+                    method, endpoint, response.status_code,
+                )
                 return response
             if attempt == self.max_retries:
                 if response.status_code == 429:

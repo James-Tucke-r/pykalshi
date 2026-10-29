@@ -4,6 +4,15 @@
 
 ### Breaking changes
 
+- **A POST or PATCH that may have reached the server is no longer re-sent.**
+  The request loop used to retry every method on a read timeout and on
+  500/502/503/504, so one timed-out order or transfer could be repeated up to
+  three times (transfers and subaccount creation carry no idempotency key).
+  Now these methods are retried only when the request provably never arrived
+  (connection refused, connect or pool timeout) or got a 429. A read or write
+  timeout raises, and a 5xx raises from the response handler: check state
+  (e.g. look the order up by `client_order_id`) before sending it again.
+  GET, PUT and DELETE keep their retries.
 - **Removed `place_order(buy_max_cost_dollars=...)`.** The V2 create-order
   request (`CreateOrderV2Request`) has no such field, so the advertised
   slippage protection was a **silent no-op**: the server ignored the field

@@ -32,6 +32,19 @@ DEMO_API_BASE = "https://external-api.demo.kalshi.co/trade-api/v2"
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
+# Replaying a request that may already have reached the server can repeat its
+# side effect: a POST that timed out waiting for its response may have placed
+# the order or moved the money, and sending it again does it twice. None of the
+# money-moving endpoints guarantee idempotency -- the intra-account transfer and
+# create-subaccount requests carry no idempotency key at all, and orders are
+# only idempotent when the caller supplies client_order_id.
+#
+# So these methods are retried only when the request provably never arrived
+# (connection refused, a timeout while connecting or waiting for a pooled
+# connection) or was explicitly refused (429). A read timeout or a 5xx is
+# surfaced to the caller instead of being silently re-sent.
+_NON_IDEMPOTENT_METHODS = frozenset({"POST", "PATCH"})
+
 
 class _BaseKalshiClient:
     """Config, authentication, signing, headers, and error handling.
